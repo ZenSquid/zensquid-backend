@@ -2,11 +2,12 @@ import { SquidService, webhook } from "@squidcloud/backend";
 import { WebhookRequest } from "@squidcloud/backend";
 import { requestSchema, insertMeetingMetadataSchema } from "schema";
 import type { TranscriptBlock } from "types";
+import PptxGenJS from "pptxgenjs";
+import { z } from "zod";
 
 export class SummaryService extends SquidService {
   @webhook("summary-service-webhook")
   async handleSummary(request: WebhookRequest): Promise<object> {
-    console.log(request.body);
     const parsedRequest = requestSchema.safeParse(request.body);
     if (!parsedRequest.success) {
       return {
@@ -15,8 +16,7 @@ export class SummaryService extends SquidService {
       };
     }
 
-    const { id, email, transcript } =
-      parsedRequest.data;
+    const { id, email, transcript } = parsedRequest.data;
     const prompt = generatePrompt(transcript);
     const result = await this.squid
       .ai()
@@ -26,7 +26,6 @@ export class SummaryService extends SquidService {
         temperature: 0.3,
       });
 
-    console.log(result);
     const parsedResult = insertMeetingMetadataSchema.safeParse(JSON.parse(result));
     if (!parsedResult.success) {
       return {
@@ -45,8 +44,7 @@ export class SummaryService extends SquidService {
         email,
         ...parsedResult.data,
       }),
-    })
-    console.log(await res.json());
+    });
 
     if (!res.ok) {
       return {
@@ -55,10 +53,64 @@ export class SummaryService extends SquidService {
       };
     }
 
+    const pptxBlob = await this.generatePresentation(parsedResult.data, id);
+    const uploadUrl = await this.getPresignedUploadUrl(`presentation-${id}.pptx`);
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+      body: pptxBlob,
+    });
+
+    if (!uploadRes.ok) {
+      return {
+        success: false,
+        error: "Failed to upload presentation",
+      };
+    }
+
     return {
       success: true,
       error: null,
     };
+  }
+
+  private async generatePresentation(data: z.infer<typeof insertMeetingMetadataSchema>, id: string) {
+    const pptx = new PptxGenJS();
+
+    let slide = pptx.addSlide();
+    slide.addText(data.title, { x: 1, y: 1, w: '80%', h: 1, fontSize: 24, bold: true });
+
+    slide = pptx.addSlide();
+    slide.addText("Summary", { x: 1, y: 0.5, fontSize: 18, bold: true });
+    slide.addText(data.description, { x: 1, y: 1, w: '80%', h: 4, fontSize: 14 });
+
+    slide = pptx.addSlide();
+    slide.addText("Key Points", { x: 1, y: 0.5, fontSize: 18, bold: true });
+    data.takeaways.forEach((point: string, index: number) => {
+      slide.addText(`• ${point}`, { x: 1, y: 1 + index * 0.5, fontSize: 14 });
+    });
+
+    slide = pptx.addSlide();
+    slide.addText("Action Items", { x: 1, y: 0.5, fontSize: 18, bold: true });
+    data.actionItems.forEach((item, index: number) => {
+      slide.addText(`• ${item.description}`, { x: 1, y: 1 + index * 0.5, fontSize: 14 });
+    });
+
+    return pptx.write()
+  }
+
+  private async getPresignedUploadUrl(id: string): Promise<string> {
+    const response = await fetch(`${process.env.BACKEND_API_URL}/signed-url/${id}`);
+
+    if (!response.ok) {
+      throw new Error('Failed to get pre-signed upload URL');
+    }
+
+    const data = await response.json();
+    return data.url;
   }
 }
 
